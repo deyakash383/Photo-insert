@@ -49,7 +49,9 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 try:
-    from openpyxl import load_workbook
+    from openpyxl import Workbook, load_workbook
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
     from openpyxl.drawing.image import Image as XLImage
     from openpyxl.drawing.spreadsheet_drawing import AnchorMarker, TwoCellAnchor
     from openpyxl.utils.units import pixels_to_EMU
@@ -75,6 +77,7 @@ DEFAULT_ZIP_NAME = "IEMS Documents.zip"
 # Output naming:  <excel name>_with_photos.xlsx  and  <excel name>_photo_report.csv
 OUTPUT_SUFFIX = "_with_photos"
 REPORT_SUFFIX = "_photo_report.csv"
+FULL_REPORT_SUFFIX = "_full_report.xlsx"   # every student: all details + photo + status
 
 # Column headers to look for (case, spaces and dots are ignored when matching).
 APP_NO_HEADER = "App.No"
@@ -150,6 +153,7 @@ class FileEntry:
     dir_path: str          # folder containing the file
     filename: str
     crc: int
+    stem_alnum: str = ""   # file name without extension, letters+digits only
 
 
 @dataclass
@@ -164,6 +168,9 @@ class Record:
     partial_folder: bool = False
     fallback_photo: bool = False
     matched_folders: List[str] = field(default_factory=list)
+    photo_file: str = ""            # file used inside the ZIP
+    photo_bytes: bytes = b""        # resized JPEG that was embedded
+    photo_size: Tuple[int, int] = (0, 0)
     issues: List[Tuple[str, str]] = field(default_factory=list)  # (code, detail)
 
 
@@ -174,6 +181,7 @@ class ZipIndex:
     dir_info: Dict[str, Tuple[str, str]]         # dir path -> (name, alnum name)
     files_under: Dict[str, Dict[str, FileEntry]]  # dir path -> every file below it
     leaf_dirs: Set[str]                          # dirs that directly hold files
+    all_images: List[FileEntry] = field(default_factory=list)  # every .jpg/.jpeg/.png
 
 
 # -----------------------------------------------------------------------------
@@ -317,18 +325,24 @@ def build_zip_index(zf: zipfile.ZipFile) -> ZipIndex:
     files_under: Dict[str, Dict[str, FileEntry]] = defaultdict(dict)
     dir_names: Dict[str, str] = {}
     leaf_dirs: Set[str] = set()
+    all_images: List[FileEntry] = []
 
     for info in zf.infolist():
         if info.is_dir():
             continue
         path = info.filename.replace("\\", "/")           # Windows-made ZIPs
         parts = [p for p in path.split("/") if p]
-        if len(parts) < 2:
+        if not parts:
             continue
         if "__MACOSX" in parts or parts[-1].startswith("._") \
                 or parts[-1].lower() == "thumbs.db":
             continue
-        entry = FileEntry(info.filename, "/".join(parts[:-1]), parts[-1], info.CRC)
+        entry = FileEntry(info.filename, "/".join(parts[:-1]), parts[-1], info.CRC,
+                          alnum(Path(parts[-1]).stem))
+        if is_image_name(entry.filename):
+            all_images.append(entry)
+        if len(parts) < 2:              # file sitting directly in the ZIP root
+            continue
         leaf_dirs.add(entry.dir_path)
         for i in range(1, len(parts)):
             d = "/".join(parts[:i])
@@ -342,7 +356,7 @@ def build_zip_index(zf: zipfile.ZipFile) -> ZipIndex:
         by_key[make_key(name)].append(d)
         by_alnum[alnum(name)].append(d)
         dir_info[d] = (name, alnum(name))
-    return ZipIndex(by_key, by_alnum, dir_info, files_under, leaf_dirs)
+    return ZipIndex(by_key, by_alnum, dir_info, files_under, leaf_dirs, all_images)
 
 
 def top_level(paths: List[str]) -> List[str]:
@@ -380,6 +394,37 @@ def find_student_folders(rec: Record, index: ZipIndex,
                 if na not in others and spattern.search(name)]
         if hits:
             return top_level(hits), "folder name contains serial number %s" % serial
+    return [], ""
+
+
+def find_photo_files(rec: Record, index: ZipIndex,
+                     excel_alnums: Set[str]) -> Tuple[List[FileEntry], str]:
+    """For ZIPs where the photos are NOT in per-student folders (all photos in one
+    folder, named like 'PhotoMSU-WI_2026-27_15526.jpg').
+    Tries: file name contains the full App.No -> file name ends with the same
+    serial number (last digits of the App.No, e.g. 15526)."""
+    imgs = index.all_images
+    pattern = re.compile(r"(?<!\d)%s(?!\d)" % re.escape(rec.alnum))
+    hits = [f for f in imgs if pattern.search(f.stem_alnum)]
+    if hits:
+        return hits, "file name contains the App.No"
+    if not ALLOW_PARTIAL_FOLDER_MATCH:
+        return [], ""
+    serial = last_serial(rec.app_no)
+    if not serial:
+        return [], ""
+    others = [o for o in excel_alnums if o and o != rec.alnum]
+
+    def belongs_to_other(f: FileEntry) -> bool:
+        return any(re.search(r"(?<!\d)%s(?!\d)" % re.escape(o), f.stem_alnum) for o in others)
+
+    def file_serial(f: FileEntry) -> str:
+        groups = re.findall(r"\d+", Path(f.filename).stem)
+        return groups[-1] if groups else ""
+
+    hits = [f for f in imgs if file_serial(f) == serial and not belongs_to_other(f)]
+    if hits:
+        return hits, "file name has the same serial number %s" % serial
     return [], ""
 
 
@@ -512,6 +557,8 @@ def process(excel_path: Path, zip_path: Path) -> Tuple[int, str]:
             records.append(rec)
 
         key_counts = Counter(rec.key for rec in records if rec.key)
+        flat_dirs: Set[str] = set()      # folders whose photos were matched by file name
+        used_files: Set[str] = set()     # photo files actually inserted
         excel_alnums = {rec.alnum for rec in records if rec.alnum}
 
         # ---- Cell geometry --------------------------------------------------
@@ -544,32 +591,45 @@ def process(excel_path: Path, zip_path: Path) -> Tuple[int, str]:
                                    % key_counts[rec.key]))
 
             folder_paths, how = find_student_folders(rec, index, excel_alnums)
-            if not folder_paths:
-                rec.outcome = MISSING_FOLDER
-                serial = last_serial(rec.app_no)
-                rec.issues.append((MISSING_FOLDER,
-                                   "No ZIP folder matches '%s'%s" % (
-                                       rec.key,
-                                       " (also tried serial number %s)" % serial
-                                       if serial and ALLOW_PARTIAL_FOLDER_MATCH else "")))
-                continue
-            rec.matched_folders = folder_paths
-
-            if how not in ("exact", "separator-insensitive"):
-                rec.partial_folder = True
-                rec.issues.append(("PARTIAL_FOLDER_MATCH",
-                                   "Matched by %s -> %s (please verify)"
-                                   % (how, " | ".join(folder_paths))))
-
-            if len(folder_paths) > 1:
-                rec.dup_zip = True
-                rec.issues.append(("DUPLICATE_FOLDER_IN_ZIP",
-                                   "Folder found %d times: %s"
-                                   % (len(folder_paths), " | ".join(folder_paths))))
-
             files: Dict[str, FileEntry] = {}
-            for fp in folder_paths:
-                files.update(index.files_under.get(fp, {}))
+            if not folder_paths:
+                # no student folder -> look for the photo by its FILE name instead
+                flat, fhow = find_photo_files(rec, index, excel_alnums)
+                if not flat:
+                    rec.outcome = MISSING_FOLDER
+                    serial = last_serial(rec.app_no)
+                    rec.issues.append((MISSING_FOLDER,
+                                       "No ZIP folder or photo file matches '%s'%s" % (
+                                           rec.key,
+                                           " (also tried serial number %s)" % serial
+                                           if serial and ALLOW_PARTIAL_FOLDER_MATCH else "")))
+                    continue
+                files = {f.zip_path: f for f in flat}
+                flat_dirs.update(f.dir_path for f in flat)
+                rec.matched_folders = sorted({f.dir_path for f in flat if f.dir_path})
+                if fhow != "file name contains the App.No":
+                    rec.partial_folder = True
+                    rec.issues.append(("PARTIAL_FILE_MATCH",
+                                       "Matched because the %s -> %s (App.No in the file name differs; "
+                                       "please verify)"
+                                       % (fhow, " | ".join(f.zip_path for f in flat))))
+            else:
+                rec.matched_folders = folder_paths
+
+                if how not in ("exact", "separator-insensitive"):
+                    rec.partial_folder = True
+                    rec.issues.append(("PARTIAL_FOLDER_MATCH",
+                                       "Matched by %s -> %s (please verify)"
+                                       % (how, " | ".join(folder_paths))))
+
+                if len(folder_paths) > 1:
+                    rec.dup_zip = True
+                    rec.issues.append(("DUPLICATE_FOLDER_IN_ZIP",
+                                       "Folder found %d times: %s"
+                                       % (len(folder_paths), " | ".join(folder_paths))))
+
+                for fp in folder_paths:
+                    files.update(index.files_under.get(fp, {}))
             candidates, tier = pick_photo_candidates(list(files.values()))
 
             if not candidates:
@@ -577,7 +637,8 @@ def process(excel_path: Path, zip_path: Path) -> Tuple[int, str]:
                 detail = ("Folder '%s' has only document scans (Aadhar/ID/etc.), no photograph"
                           if tier == "only-documents"
                           else "Folder '%s' has no .jpg/.jpeg/.png image")
-                rec.issues.append((MISSING_PHOTO, detail % folder_paths[0]))
+                rec.issues.append((MISSING_PHOTO, detail % (
+                    folder_paths[0] if folder_paths else "matched files")))
                 continue
 
             if len(candidates) > 1:
@@ -607,6 +668,9 @@ def process(excel_path: Path, zip_path: Path) -> Tuple[int, str]:
                                       else "only non-document image in the folder")))
             try:
                 buf, w, h = prepare_photo(zf.read(chosen.zip_path))
+                used_files.add(chosen.zip_path)
+                rec.photo_file, rec.photo_bytes, rec.photo_size = \
+                    chosen.zip_path, buf.getvalue(), (w, h)
                 add_centered_image(ws, buf, w, h, rec.row, pic_col, cell_w, cell_h)
                 rec.outcome = INSERTED
             except Exception as exc:                        # corrupt image etc.
@@ -637,6 +701,11 @@ def process(excel_path: Path, zip_path: Path) -> Tuple[int, str]:
                                  for i in range(1, len(parts) + 1))
             if not inside_matched and d not in ancestors:
                 orphan_folders.append(d)
+        # photo files (matched by file name) that no Excel row uses
+        for e in index.all_images:
+            if e.dir_path in flat_dirs and e.zip_path not in used_files \
+                    and not looks_like_document(e.filename):
+                orphan_folders.append(e.zip_path)
 
         # ---- Save workbook (never overwrite the original) --------------------
         out_path = excel_path.with_name(excel_path.stem + OUTPUT_SUFFIX + excel_path.suffix)
@@ -656,6 +725,9 @@ def process(excel_path: Path, zip_path: Path) -> Tuple[int, str]:
     # ---- Report CSV -----------------------------------------------------------
     report_path = excel_path.with_name(excel_path.stem + REPORT_SUFFIX)
     rows_written = write_report(report_path, records, orphan_folders)
+    full_path = write_full_report(excel_path, ws, header_row, pic_col, records,
+                                  orphan_folders, cell_w, cell_h)
+    print("\nFull report (all details + photo): %s" % full_path)
 
     # ---- Summary ----------------------------------------------------------------
     return print_summary(records, orphan_folders, out_path, report_path, rows_written, started)
@@ -668,8 +740,12 @@ def write_report(path: Path, records: List[Record], orphans: List[str]) -> int:
             lines.append([rec.row, rec.app_no, rec.key, code,
                           "YES" if rec.outcome == INSERTED else "NO", detail])
     for key in orphans:
-        lines.append(["", "", key, "ZIP_FOLDER_NOT_IN_EXCEL", "NO",
-                      "Folder has files but matches no Excel App.No"])
+        if is_image_name(key):
+            lines.append(["", "", key, "ZIP_PHOTO_NOT_IN_EXCEL", "NO",
+                          "Photo file matches no Excel App.No"])
+        else:
+            lines.append(["", "", key, "ZIP_FOLDER_NOT_IN_EXCEL", "NO",
+                          "Folder has files but matches no Excel App.No"])
 
     target = path
     try:
@@ -684,6 +760,85 @@ def write_report(path: Path, records: List[Record], orphans: List[str]) -> int:
                          "Issue", "Photo Inserted", "Details"])
         writer.writerows(lines)
     return len(lines)
+
+
+def write_full_report(excel_path: Path, src_ws, header_row: int, pic_col: int,
+                      records: List[Record], orphans: List[str],
+                      cell_w: int, cell_h: int) -> Path:
+    """Excel report with EVERY student: photo + all original columns + status."""
+    wbr = Workbook()
+    ws = wbr.active
+    ws.title = "Full Report"
+    src_cols = [c for c in range(1, src_ws.max_column + 1) if c != pic_col]
+    extra = ["Photo Status", "Matched ZIP Folder", "Photo File Used", "Remarks"]
+    headers = ["Photo"] + [clean_text(src_ws.cell(header_row, c).value) for c in src_cols] + extra
+
+    head_fill = PatternFill("solid", fgColor="1F4E78")
+    for i, h in enumerate(headers, start=1):
+        cell = ws.cell(1, i, h)
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = head_fill
+        cell.alignment = Alignment(vertical="center", horizontal="center", wrap_text=True)
+    ws.row_dimensions[1].height = 30
+    ws.column_dimensions["A"].width = col_width_for_pixels(cell_w)
+
+    ok_fill = PatternFill("solid", fgColor="E2F0D9")
+    bad_fill = PatternFill("solid", fgColor="F8D7DA")
+    warn_fill = PatternFill("solid", fgColor="FFF2CC")
+
+    for n, rec in enumerate(records, start=2):
+        ws.row_dimensions[n].height = row_height_for_pixels(cell_h)
+        for j, c in enumerate(src_cols, start=2):
+            v = src_ws.cell(rec.row, c).value
+            ws.cell(n, j, v).alignment = Alignment(vertical="center", wrap_text=True)
+        base = 2 + len(src_cols)
+        remarks = " | ".join("%s: %s" % (code, det) for code, det in rec.issues)
+        status = "PHOTO INSERTED" if rec.outcome == INSERTED else (rec.outcome or "NOT PROCESSED")
+        values = [status, " | ".join(rec.matched_folders), rec.photo_file, remarks]
+        for k, v in enumerate(values):
+            ws.cell(n, base + k, v).alignment = Alignment(vertical="center", wrap_text=True)
+        colour = ok_fill if rec.outcome == INSERTED and not rec.issues else \
+            (warn_fill if rec.outcome == INSERTED else bad_fill)
+        ws.cell(n, base).fill = colour
+        if rec.photo_bytes:
+            add_centered_image(ws, io.BytesIO(rec.photo_bytes), rec.photo_size[0],
+                               rec.photo_size[1], n, 1, cell_w, cell_h)
+
+    for j in range(2, len(headers) + 1):
+        letter = get_column_letter(j)
+        longest = max([len(str(ws.cell(r, j).value or "")) for r in range(1, min(ws.max_row, 60) + 1)] + [8])
+        ws.column_dimensions[letter].width = min(max(12, longest + 2), 45)
+    ws.freeze_panes = "B2"
+    ws.auto_filter.ref = "A1:%s%d" % (get_column_letter(len(headers)), max(ws.max_row, 2))
+
+    # ---- Summary sheet --------------------------------------------------------
+    sm = wbr.create_sheet("Summary", 0)
+    count = Counter(r.outcome for r in records)
+    rows = [("Total Excel records", len(records)),
+            ("Photos inserted", count[INSERTED]),
+            ("Missing folder in ZIP", count[MISSING_FOLDER]),
+            ("Folder without photo", count[MISSING_PHOTO]),
+            ("Duplicate / different photos skipped", count[AMBIGUOUS_DUPLICATE]),
+            ("Invalid App.No", count[INVALID_APP_NO]),
+            ("Unreadable images", count[UNREADABLE_IMAGE]),
+            ("ZIP folders not in Excel", len(orphans))]
+    sm.column_dimensions["A"].width = 40
+    sm.column_dimensions["B"].width = 14
+    for i, (label, val) in enumerate(rows, start=1):
+        sm.cell(i, 1, label).font = Font(bold=True)
+        sm.cell(i, 2, val)
+    if orphans:
+        sm.cell(len(rows) + 2, 1, "ZIP folders not found in Excel:").font = Font(bold=True)
+        for i, o in enumerate(orphans, start=len(rows) + 3):
+            sm.cell(i, 1, o)
+
+    path = excel_path.with_name(excel_path.stem + FULL_REPORT_SUFFIX)
+    try:
+        wbr.save(path)
+    except PermissionError:
+        path = path.with_name("%s_%s%s" % (path.stem, datetime.now().strftime("%Y%m%d_%H%M%S"), path.suffix))
+        wbr.save(path)
+    return path
 
 
 def print_summary(records, orphans, out_path, report_path, rows_written, started):
